@@ -573,7 +573,7 @@ SELECT aip.aip_id
       ,aip.modified_date
   FROM IDP.AUTH_IDENTITY_PROVIDERS aip;
 
-COMMENT ON VIEW IDP.AUTH_PROVIDERS_VW 
+COMMENT ON TABLE IDP.AUTH_PROVIDERS_VW 
     IS 'Provider summary with connection endpoints and usage statistics';
 
 CREATE OR REPLACE VIEW IDP.AUTH_ACTIVE_SESSIONS_VW AS
@@ -598,7 +598,7 @@ SELECT aso.aso_id AS session_id
    AND aso.is_valid = 'Y'
    AND aso.expires_date > SYSTIMESTAMP;
 
-COMMENT ON VIEW IDP.AUTH_ACTIVE_SESSIONS_VW 
+COMMENT ON TABLE IDP.AUTH_ACTIVE_SESSIONS_VW 
     IS 'Active session monitoring with provider details';
 
 CREATE OR REPLACE VIEW IDP.AUTH_FEDERATION_STATS_VW AS
@@ -616,7 +616,7 @@ SELECT afl.tenant_id
  ORDER BY event_date DESC
          ,afl.event_type;
 
-COMMENT ON VIEW IDP.AUTH_FEDERATION_STATS_VW 
+COMMENT ON TABLE IDP.AUTH_FEDERATION_STATS_VW 
     IS 'Authentication statistics aggregated by date and event type';
 
 PROMPT Created: Views (AUTH_PROVIDERS_VW, AUTH_ACTIVE_SESSIONS_VW, AUTH_FEDERATION_STATS_VW)
@@ -641,6 +641,307 @@ PROMPT Views Created:
 PROMPT   AUTH_PROVIDERS_VW         - Provider summary
 PROMPT   AUTH_ACTIVE_SESSIONS_VW   - Active session monitoring
 PROMPT   AUTH_FEDERATION_STATS_VW  - Authentication statistics
+PROMPT 
+PROMPT ========================================================================
+
+SET DEFINE ON;
+
+-- ============================================================================
+-- Identity Provider (IDP) Schema - Multi-Factor Authentication Tables
+-- ============================================================================
+-- Schema: IDP
+-- Purpose: TOTP-based MFA compatible with Microsoft Authenticator, Google 
+--          Authenticator, Authy, and other RFC 6238 compliant apps
+-- Version: 1.0
+-- ============================================================================
+--
+-- TABLE ALIASES:
+--   AUTH_MFA_CONFIG          - amc
+--   AUTH_MFA_ENROLLMENT      - ame
+--   AUTH_MFA_BACKUP_CODES    - amb
+--   AUTH_MFA_TRUSTED_DEVICES - amt
+--   AUTH_MFA_CHALLENGES      - amh
+--
+-- ============================================================================
+
+SET DEFINE OFF;
+SET SERVEROUTPUT ON SIZE UNLIMITED;
+
+PROMPT ========================================================================
+PROMPT IDP Schema - MFA Tables Installation
+PROMPT ========================================================================
+
+-- ============================================================================
+-- SECTION 1: AUTH_MFA_CONFIG (Alias: amc)
+-- Tenant-level MFA policy configuration
+-- ============================================================================
+
+CREATE TABLE IDP.AUTH_MFA_CONFIG
+    (amc_id                     NUMBER GENERATED ALWAYS AS IDENTITY
+    ,tenant_id                  NUMBER NOT NULL
+    ,mfa_required               VARCHAR2(1) DEFAULT 'N'
+    ,mfa_required_roles         VARCHAR2(1000)
+    ,mfa_grace_period_days      NUMBER DEFAULT 7
+    ,totp_issuer                VARCHAR2(100) DEFAULT 'ComplianceVault'
+    ,totp_algorithm             VARCHAR2(10) DEFAULT 'SHA1'
+    ,totp_digits                NUMBER DEFAULT 6
+    ,totp_period                NUMBER DEFAULT 30
+    ,totp_window                NUMBER DEFAULT 1
+    ,backup_code_count          NUMBER DEFAULT 10
+    ,backup_code_length         NUMBER DEFAULT 8
+    ,remember_device_enabled    VARCHAR2(1) DEFAULT 'Y'
+    ,remember_device_days       NUMBER DEFAULT 30
+    ,max_failed_attempts        NUMBER DEFAULT 5
+    ,lockout_duration_minutes   NUMBER DEFAULT 15
+    ,created_date               TIMESTAMP DEFAULT SYSTIMESTAMP
+    ,created_by                 VARCHAR2(100) DEFAULT USER
+    ,modified_date              TIMESTAMP
+    ,modified_by                VARCHAR2(100)
+    ,CONSTRAINT amc_pk PRIMARY KEY (amc_id)
+    ,CONSTRAINT amc_mfa_required_chk 
+        CHECK (mfa_required IN ('Y','N'))
+    ,CONSTRAINT amc_totp_algorithm_chk 
+        CHECK (totp_algorithm IN ('SHA1','SHA256','SHA512'))
+    ,CONSTRAINT amc_totp_digits_chk 
+        CHECK (totp_digits IN (6, 8))
+    ,CONSTRAINT amc_remember_device_chk 
+        CHECK (remember_device_enabled IN ('Y','N'))
+    ,CONSTRAINT amc_tenant_uk 
+        UNIQUE (tenant_id)
+    );
+
+/*
+CREATE INDEX IDP.amc_tenant_idx 
+    ON IDP.AUTH_MFA_CONFIG(tenant_id);
+*/
+
+COMMENT ON TABLE IDP.AUTH_MFA_CONFIG 
+    IS 'Tenant-level MFA policy configuration';
+
+PROMPT Created: AUTH_MFA_CONFIG (amc)
+
+-- ============================================================================
+-- SECTION 2: AUTH_MFA_ENROLLMENT (Alias: ame)
+-- User MFA enrollment and TOTP secrets
+-- ============================================================================
+
+CREATE TABLE IDP.AUTH_MFA_ENROLLMENT
+    (ame_id                     NUMBER GENERATED ALWAYS AS IDENTITY
+    ,tenant_id                  NUMBER NOT NULL
+    ,user_id                    VARCHAR2(100) NOT NULL
+    ,totp_secret_encrypted      RAW(256) NOT NULL
+    ,totp_secret_salt           RAW(32) NOT NULL
+    ,enrollment_status          VARCHAR2(20) DEFAULT 'PENDING'
+    ,enrolled_date              TIMESTAMP
+    ,verified_date              TIMESTAMP
+    ,last_used_date             TIMESTAMP
+    ,use_count                  NUMBER DEFAULT 0
+    ,recovery_email             VARCHAR2(255)
+    ,recovery_phone             VARCHAR2(50)
+    ,created_date               TIMESTAMP DEFAULT SYSTIMESTAMP
+    ,created_by                 VARCHAR2(100) DEFAULT USER
+    ,modified_date              TIMESTAMP
+    ,modified_by                VARCHAR2(100)
+    ,disabled_date              TIMESTAMP
+    ,disabled_by                VARCHAR2(100)
+    ,disabled_reason            VARCHAR2(500)
+    ,CONSTRAINT ame_pk PRIMARY KEY (ame_id)
+    ,CONSTRAINT ame_status_chk 
+        CHECK (enrollment_status IN ('PENDING','VERIFIED','DISABLED','SUSPENDED'))
+    ,CONSTRAINT ame_tenant_user_uk 
+        UNIQUE (tenant_id, user_id)
+    );
+
+CREATE INDEX IDP.ame_user_idx 
+    ON IDP.AUTH_MFA_ENROLLMENT(user_id, enrollment_status);
+
+CREATE INDEX IDP.ame_tenant_idx 
+    ON IDP.AUTH_MFA_ENROLLMENT(tenant_id);
+
+COMMENT ON TABLE IDP.AUTH_MFA_ENROLLMENT 
+    IS 'User MFA enrollment and encrypted TOTP secrets';
+
+PROMPT Created: AUTH_MFA_ENROLLMENT (ame)
+
+-- ============================================================================
+-- SECTION 3: AUTH_MFA_BACKUP_CODES (Alias: amb)
+-- One-time backup recovery codes
+-- ============================================================================
+
+CREATE TABLE IDP.AUTH_MFA_BACKUP_CODES
+    (amb_id                     NUMBER GENERATED ALWAYS AS IDENTITY
+    ,amb_ame_id                 NUMBER NOT NULL
+    ,code_hash                  VARCHAR2(256) NOT NULL
+    ,is_used                    VARCHAR2(1) DEFAULT 'N'
+    ,used_date                  TIMESTAMP
+    ,used_ip                    VARCHAR2(50)
+    ,created_date               TIMESTAMP DEFAULT SYSTIMESTAMP
+    ,CONSTRAINT amb_pk PRIMARY KEY (amb_id)
+    ,CONSTRAINT amb_ame_id_fk 
+        FOREIGN KEY (amb_ame_id) 
+        REFERENCES IDP.AUTH_MFA_ENROLLMENT(ame_id) ON DELETE CASCADE
+    ,CONSTRAINT amb_is_used_chk 
+        CHECK (is_used IN ('Y','N'))
+    );
+
+CREATE INDEX IDP.amb_ame_id_idx 
+    ON IDP.AUTH_MFA_BACKUP_CODES(amb_ame_id, is_used);
+
+COMMENT ON TABLE IDP.AUTH_MFA_BACKUP_CODES 
+    IS 'One-time backup recovery codes for MFA';
+
+PROMPT Created: AUTH_MFA_BACKUP_CODES (amb)
+
+-- ============================================================================
+-- SECTION 4: AUTH_MFA_TRUSTED_DEVICES (Alias: amt)
+-- Trusted devices (Remember This Device)
+-- ============================================================================
+
+CREATE TABLE IDP.AUTH_MFA_TRUSTED_DEVICES
+    (amt_id                     NUMBER GENERATED ALWAYS AS IDENTITY
+    ,tenant_id                  NUMBER NOT NULL
+    ,user_id                    VARCHAR2(100) NOT NULL
+    ,device_token               VARCHAR2(256) NOT NULL
+    ,device_name                VARCHAR2(255)
+    ,device_fingerprint         VARCHAR2(500)
+    ,user_agent                 VARCHAR2(1000)
+    ,ip_address                 VARCHAR2(50)
+    ,trusted_until              TIMESTAMP NOT NULL
+    ,last_used_date             TIMESTAMP
+    ,use_count                  NUMBER DEFAULT 0
+    ,is_active                  VARCHAR2(1) DEFAULT 'Y'
+    ,revoked_date               TIMESTAMP
+    ,revoked_by                 VARCHAR2(100)
+    ,created_date               TIMESTAMP DEFAULT SYSTIMESTAMP
+    ,CONSTRAINT amt_pk PRIMARY KEY (amt_id)
+    ,CONSTRAINT amt_is_active_chk 
+        CHECK (is_active IN ('Y','N'))
+    ,CONSTRAINT amt_token_uk 
+        UNIQUE (device_token)
+    );
+
+CREATE INDEX IDP.amt_user_idx 
+    ON IDP.AUTH_MFA_TRUSTED_DEVICES(tenant_id, user_id, is_active);
+
+CREATE INDEX IDP.amt_tenant_idx 
+    ON IDP.AUTH_MFA_TRUSTED_DEVICES(tenant_id);
+
+COMMENT ON TABLE IDP.AUTH_MFA_TRUSTED_DEVICES 
+    IS 'Trusted devices where MFA can be skipped (Remember this device)';
+
+PROMPT Created: AUTH_MFA_TRUSTED_DEVICES (amt)
+
+-- ============================================================================
+-- SECTION 5: AUTH_MFA_CHALLENGES (Alias: amh)
+-- Immutable log of MFA verification attempts
+-- ============================================================================
+
+CREATE TABLE IDP.AUTH_MFA_CHALLENGES
+    (amh_id                     NUMBER GENERATED ALWAYS AS IDENTITY
+    ,tenant_id                  NUMBER NOT NULL
+    ,user_id                    VARCHAR2(100) NOT NULL
+    ,challenge_type             VARCHAR2(20) NOT NULL
+    ,challenge_timestamp        TIMESTAMP DEFAULT SYSTIMESTAMP NOT NULL
+    ,was_successful             VARCHAR2(1)
+    ,failure_reason             VARCHAR2(100)
+    ,ip_address                 VARCHAR2(50)
+    ,user_agent                 VARCHAR2(1000)
+    ,session_id                 VARCHAR2(100)
+    ,created_date               TIMESTAMP DEFAULT SYSTIMESTAMP
+    ,CONSTRAINT amh_pk PRIMARY KEY (amh_id)
+    ,CONSTRAINT amh_challenge_type_chk 
+        CHECK (challenge_type IN ('TOTP','BACKUP_CODE','PUSH','SMS','EMAIL'))
+    ,CONSTRAINT amh_was_successful_chk 
+        CHECK (was_successful IN ('Y','N'))
+    );
+
+CREATE INDEX IDP.amh_user_idx 
+    ON IDP.AUTH_MFA_CHALLENGES(tenant_id, user_id, challenge_timestamp DESC);
+
+CREATE INDEX IDP.amh_timestamp_idx 
+    ON IDP.AUTH_MFA_CHALLENGES(challenge_timestamp DESC);
+
+CREATE INDEX IDP.amh_tenant_idx 
+    ON IDP.AUTH_MFA_CHALLENGES(tenant_id);
+
+COMMENT ON TABLE IDP.AUTH_MFA_CHALLENGES 
+    IS 'Immutable log of all MFA verification attempts';
+
+-- Protect MFA challenge log - append only
+CREATE OR REPLACE TRIGGER IDP.amh_protect_trg
+BEFORE UPDATE OR DELETE ON IDP.AUTH_MFA_CHALLENGES
+BEGIN
+    RAISE_APPLICATION_ERROR(-20001, 'AUTH_MFA_CHALLENGES is append-only for compliance');
+END;
+/
+
+PROMPT Created: AUTH_MFA_CHALLENGES (amh)
+
+-- ============================================================================
+-- SECTION 6: MFA VIEWS
+-- ============================================================================
+
+CREATE OR REPLACE VIEW IDP.AUTH_MFA_STATUS_VW AS
+SELECT ame.tenant_id
+      ,ame.user_id
+      ,ame.enrollment_status
+      ,ame.enrolled_date
+      ,ame.verified_date
+      ,ame.last_used_date
+      ,ame.use_count
+      ,(SELECT COUNT(*) 
+          FROM IDP.AUTH_MFA_BACKUP_CODES amb 
+         WHERE amb.amb_ame_id = ame.ame_id 
+           AND amb.is_used = 'N') AS backup_codes_remaining
+      ,(SELECT COUNT(*) 
+          FROM IDP.AUTH_MFA_TRUSTED_DEVICES amt 
+         WHERE amt.tenant_id = ame.tenant_id 
+           AND amt.user_id = ame.user_id 
+           AND amt.is_active = 'Y'
+           AND amt.trusted_until > SYSTIMESTAMP) AS trusted_device_count
+      ,amc.mfa_required
+      ,amc.mfa_required_roles
+  FROM IDP.AUTH_MFA_ENROLLMENT ame
+      ,IDP.AUTH_MFA_CONFIG amc
+ WHERE ame.tenant_id = amc.tenant_id(+);
+
+COMMENT ON TABLE IDP.AUTH_MFA_STATUS_VW 
+    IS 'User MFA enrollment status with backup codes and trusted device counts';
+
+CREATE OR REPLACE VIEW IDP.AUTH_MFA_FAILED_ATTEMPTS_VW AS
+SELECT amh.tenant_id
+      ,amh.user_id
+      ,amh.ip_address
+      ,COUNT(*) AS failed_count
+      ,MIN(amh.challenge_timestamp) AS first_attempt
+      ,MAX(amh.challenge_timestamp) AS last_attempt
+  FROM IDP.AUTH_MFA_CHALLENGES amh
+ WHERE amh.was_successful = 'N'
+   AND amh.challenge_timestamp > SYSTIMESTAMP - INTERVAL '15' MINUTE
+ GROUP BY amh.tenant_id
+         ,amh.user_id
+         ,amh.ip_address
+HAVING COUNT(*) >= 3;
+
+COMMENT ON TABLE IDP.AUTH_MFA_FAILED_ATTEMPTS_VW 
+    IS 'Users with multiple failed MFA attempts (potential lockout candidates)';
+
+PROMPT Created: MFA Views (AUTH_MFA_STATUS_VW, AUTH_MFA_FAILED_ATTEMPTS_VW)
+
+PROMPT ========================================================================
+PROMPT IDP Schema MFA Tables Installation Complete
+PROMPT ========================================================================
+PROMPT 
+PROMPT MFA Tables Created (with aliases):
+PROMPT   AUTH_MFA_CONFIG          (amc) - Tenant MFA policy
+PROMPT   AUTH_MFA_ENROLLMENT      (ame) - User enrollment & TOTP secrets
+PROMPT   AUTH_MFA_BACKUP_CODES    (amb) - One-time backup codes
+PROMPT   AUTH_MFA_TRUSTED_DEVICES (amt) - Remember this device
+PROMPT   AUTH_MFA_CHALLENGES      (amh) - MFA attempt audit log
+PROMPT 
+PROMPT MFA Views Created:
+PROMPT   AUTH_MFA_STATUS_VW           - User MFA status summary
+PROMPT   AUTH_MFA_FAILED_ATTEMPTS_VW  - Failed attempt monitoring
 PROMPT 
 PROMPT ========================================================================
 
