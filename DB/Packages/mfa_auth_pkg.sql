@@ -589,6 +589,19 @@ AS
         END LOOP;
         
         log_challenge(pn_tenant_id, pv_user_id, gc_challenge_totp, TRUE);
+        
+         -- Bridge enrollment completion to DMS SOC2
+         BEGIN
+             IDP.idp_dms_bridge_pkg.bridge_mfa_enrollment(
+                 pn_tenant_id        => pn_tenant_id
+                ,pv_user_id          => pv_user_id
+                ,pv_action           => 'COMPLETED'
+                ,pv_ip_address       => NULL  -- Not available in this function
+             );
+         EXCEPTION
+             WHEN OTHERS THEN NULL;
+         END;
+        
         COMMIT;
         RETURN TRUE;
     EXCEPTION
@@ -655,10 +668,38 @@ AS
                SET last_used_date = SYSTIMESTAMP, use_count = use_count + 1
              WHERE ame_id = ln_ame_id;
             log_challenge(pn_tenant_id, pv_user_id, gc_challenge_totp, TRUE, NULL, pv_client_ip, NULL, pv_session_id);
+
+            -- Bridge MFA verification to DMS SOC2
+            BEGIN
+               IDP.idp_dms_bridge_pkg.bridge_mfa_challenge(
+                   pn_tenant_id        => pn_tenant_id
+                  ,pv_user_id          => pv_user_id
+                  ,pv_challenge_type   => 'TOTP'
+                  ,pb_was_successful   => TRUE
+                  ,pv_ip_address       => pv_client_ip
+               );
+            EXCEPTION
+               WHEN OTHERS THEN NULL;
+            END;
+            
             COMMIT;
             RETURN TRUE;
         ELSE
             log_challenge(pn_tenant_id, pv_user_id, gc_challenge_totp, FALSE, 'INVALID_CODE', pv_client_ip, NULL, pv_session_id);
+            
+            -- Bridge MFA failure to DMS SOC2
+            BEGIN
+               IDP.idp_dms_bridge_pkg.bridge_mfa_challenge(
+                   pn_tenant_id        => pn_tenant_id
+                  ,pv_user_id          => pv_user_id
+                  ,pv_challenge_type   => 'TOTP'
+                  ,pb_was_successful   => FALSE
+                  ,pv_ip_address       => pv_client_ip
+               );
+            EXCEPTION
+               WHEN OTHERS THEN NULL;
+            END;
+
             RETURN FALSE;
         END IF;
     EXCEPTION
@@ -710,6 +751,40 @@ AS
          WHERE ame_id = ln_ame_id;
         
         log_challenge(pn_tenant_id, pv_user_id, gc_challenge_backup, TRUE, NULL, pv_client_ip);
+        
+         -- Bridge backup code usage to DMS SOC2
+         DECLARE
+             ln_remaining NUMBER;
+         BEGIN
+             SELECT COUNT(*) INTO ln_remaining
+               FROM IDP.AUTH_MFA_BACKUP_CODES
+              WHERE amb_ame_id = ln_ame_id AND is_used = 'N';
+             
+             IDP.idp_dms_bridge_pkg.bridge_mfa_challenge(
+                 pn_tenant_id        => pn_tenant_id
+                ,pv_user_id          => pv_user_id
+                ,pv_challenge_type   => 'BACKUP_CODE'
+                ,pb_was_successful   => TRUE
+                ,pv_ip_address       => pv_client_ip
+             );
+             
+             -- Alert if last or no backup codes remaining
+             IF ln_remaining <= 1 THEN
+                 IDP.idp_dms_bridge_pkg.bridge_security_incident(
+                     pn_tenant_id        => pn_tenant_id
+                    ,pv_title            => 'MFA Backup Codes Nearly Exhausted'
+                    ,pv_incident_type    => 'MFA_BACKUP_LOW'
+                    ,pv_severity         => CASE WHEN ln_remaining = 0 THEN 'HIGH' ELSE 'MEDIUM' END
+                    ,pc_description      => 'User ' || pv_user_id || 
+                                            ' has ' || ln_remaining || ' MFA backup code(s) remaining.'
+                    ,pv_username         => pv_user_id
+                    ,pv_ip_address       => pv_client_ip
+                 );
+             END IF;
+         EXCEPTION
+             WHEN OTHERS THEN NULL;
+         END;
+        
         COMMIT;
         RETURN TRUE;
     EXCEPTION
@@ -996,6 +1071,19 @@ AS
         UPDATE IDP.AUTH_MFA_TRUSTED_DEVICES
            SET is_active = 'N', revoked_date = SYSTIMESTAMP, revoked_by = pv_disabled_by
          WHERE tenant_id = pn_tenant_id AND user_id = pv_user_id AND is_active = 'Y';
+         
+        -- Bridge enrollment completion to DMS SOC2
+        BEGIN
+           IDP.idp_dms_bridge_pkg.bridge_mfa_enrollment(
+               pn_tenant_id        => pn_tenant_id
+              ,pv_user_id          => pv_user_id
+              ,pv_action           => 'COMPLETED'
+              ,pv_ip_address       => NULL  -- Not available in this function
+           );
+        EXCEPTION
+           WHEN OTHERS THEN NULL;
+        END;
+         
         COMMIT;
     END disable_mfa;
     
@@ -1040,6 +1128,29 @@ AS
         UPDATE IDP.AUTH_MFA_TRUSTED_DEVICES
            SET is_active = 'N', revoked_date = SYSTIMESTAMP, revoked_by = pv_reset_by
          WHERE tenant_id = pn_tenant_id AND user_id = pv_user_id AND is_active = 'Y';
+         
+        -- Bridge MFA reset to DMS SOC2
+        BEGIN
+           IDP.idp_dms_bridge_pkg.bridge_mfa_enrollment(
+               pn_tenant_id        => pn_tenant_id
+              ,pv_user_id          => pv_user_id
+              ,pv_action           => 'RESET'
+           );
+           
+           -- Create security incident for MFA reset (audit trail)
+           IDP.idp_dms_bridge_pkg.bridge_security_incident(
+               pn_tenant_id        => pn_tenant_id
+              ,pv_title            => 'MFA Reset for User'
+              ,pv_incident_type    => 'MFA_RESET'
+              ,pv_severity         => 'LOW'
+              ,pc_description      => 'MFA was reset for user ' || pv_user_id || 
+                                      ' by ' || pv_reset_by || '. User must re-enroll.'
+              ,pv_username         => pv_user_id
+           );
+        EXCEPTION
+           WHEN OTHERS THEN NULL;
+        END;
+         
         COMMIT;
     END reset_mfa;
     

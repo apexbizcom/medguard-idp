@@ -381,6 +381,34 @@ AS
     FUNCTION get_client_ip
     RETURN VARCHAR2;
 
+    FUNCTION apex_authenticate
+        (p_username     IN VARCHAR2
+        ,p_password     IN VARCHAR2
+        )
+    RETURN BOOLEAN;
+
+    PROCEDURE apex_post_auth;
+    
+    PROCEDURE verify_mfa_code
+        (p_totp_code        IN  VARCHAR2
+        ,p_remember_device  IN  VARCHAR2 DEFAULT 'N'
+        ,p_success          OUT VARCHAR2
+        ,p_message          OUT VARCHAR2
+        );
+        
+    PROCEDURE verify_backup_code
+        (p_backup_code      IN  VARCHAR2
+        ,p_success          OUT VARCHAR2
+        ,p_message          OUT VARCHAR2
+        ,p_codes_remaining  OUT NUMBER
+        );
+        
+    PROCEDURE apex_logout;
+    
+    PROCEDURE refresh_session;
+    
+    FUNCTION is_mfa_complete
+    RETURN BOOLEAN;
 END federated_auth_pkg;
 /
 
@@ -531,11 +559,113 @@ AS
         ,pv_client_ip       IN  VARCHAR2 DEFAULT NULL
         ,pv_user_agent      IN  VARCHAR2 DEFAULT NULL
         ,pv_attributes      IN  CLOB DEFAULT NULL
+        ) IS
+        lv_provider_type    VARCHAR2(30);
+    BEGIN
+        -- Get provider type if aip_id provided
+        IF pn_aip_id IS NOT NULL THEN
+            BEGIN
+                SELECT provider_type
+                  INTO lv_provider_type
+                  FROM IDP.AUTH_IDENTITY_PROVIDERS
+                 WHERE aip_id = pn_aip_id;
+            EXCEPTION
+                WHEN NO_DATA_FOUND THEN
+                    lv_provider_type := 'UNKNOWN';
+            END;
+        ELSE
+            lv_provider_type := 'NATIVE';
+        END IF;
+        
+        -- Insert into IDP audit log
+        INSERT INTO IDP.AUTH_FEDERATION_LOG
+            (tenant_id
+            ,event_type
+            ,afl_aip_id
+            ,afl_ats_id
+            ,username
+            ,external_id
+            ,client_ip
+            ,user_agent
+            ,was_successful
+            ,error_code
+            ,error_message
+            ,auth_method
+            ,attributes_received
+            )
+        VALUES
+            (pn_tenant_id
+            ,pv_event_type
+            ,pn_aip_id
+            ,pn_ats_id
+            ,pv_username
+            ,pv_external_id
+            ,pv_client_ip
+            ,pv_user_agent
+            ,CASE WHEN pb_was_successful THEN 'Y' ELSE 'N' END
+            ,pv_error_code
+            ,pv_error_message
+            ,pv_auth_method
+            ,pv_attributes
+            );
+        
+        -- ================================================================
+        -- SOC2 BRIDGE: Log to DMS compliance tables
+        -- ================================================================
+        BEGIN
+            IDP.idp_dms_bridge_pkg.log_to_dms(
+                pn_tenant_id        => pn_tenant_id
+               ,pv_username         => pv_username
+               ,pv_result           => CASE 
+                                           WHEN pb_was_successful THEN 'SUCCESS'
+                                           WHEN pv_event_type = 'AUTH_FAILURE' THEN 'FAILED'
+                                           WHEN pv_event_type = 'LOGOUT_REQUEST' THEN 'LOGOUT'
+                                           ELSE pv_event_type
+                                       END
+               ,pv_ip_address       => pv_client_ip
+               ,pv_auth_method      => NVL(pv_auth_method, 
+                                           IDP.idp_dms_bridge_pkg.map_provider_to_auth_method(lv_provider_type))
+               ,pv_mfa_method       => 'NONE'
+               ,pv_failure_reason   => pv_error_message
+               ,pv_session_id       => NULL
+               ,pv_user_agent       => pv_user_agent
+               ,pv_provider_type    => lv_provider_type
+            );
+        EXCEPTION
+            WHEN OTHERS THEN
+                -- Don't fail authentication if SOC2 bridge fails
+                NULL;
+        END;
+        
+        COMMIT;
+        
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+            RAISE;
+    END log_auth_event;
+
+    
+    PROCEDURE log_auth_event_old
+        (pn_tenant_id       IN  NUMBER
+        ,pv_event_type      IN  VARCHAR2
+        ,pn_aip_id          IN  NUMBER DEFAULT NULL
+        ,pn_ats_id          IN  NUMBER DEFAULT NULL
+        ,pv_username        IN  VARCHAR2 DEFAULT NULL
+        ,pv_external_id     IN  VARCHAR2 DEFAULT NULL
+        ,pb_was_successful  IN  BOOLEAN
+        ,pv_error_code      IN  VARCHAR2 DEFAULT NULL
+        ,pv_error_message   IN  VARCHAR2 DEFAULT NULL
+        ,pv_auth_method     IN  VARCHAR2 DEFAULT NULL
+        ,pv_client_ip       IN  VARCHAR2 DEFAULT NULL
+        ,pv_user_agent      IN  VARCHAR2 DEFAULT NULL
+        ,pv_attributes      IN  CLOB DEFAULT NULL
         )
     IS
         PRAGMA AUTONOMOUS_TRANSACTION;
         lv_was_successful   VARCHAR2(1);
         lv_client_ip        VARCHAR2(4000);
+        lv_provider_type    VARCHAR2(4000);
     BEGIN
         lv_client_ip := get_client_ip();
         lv_was_successful := CASE WHEN pb_was_successful THEN 'Y' ELSE 'N' END;
@@ -550,11 +680,38 @@ AS
             ,NVL(pv_user_agent, OWA_UTIL.GET_CGI_ENV('HTTP_USER_AGENT'))
             ,gv_request_id, lv_was_successful, pv_error_code, pv_error_message
             ,pv_auth_method, pv_attributes);
-        COMMIT;
-    EXCEPTION
-        WHEN OTHERS THEN
-            ROLLBACK;
-    END log_auth_event;
+
+        -- Bridge to DMS SOC2 logging
+        BEGIN
+          SELECT provider_type
+            INTO lv_provider_type
+            FROM AUTH_IDENTITY_PROVIDERS 
+           WHERE aip_id = pn_aip_id;
+                                         
+            IDP.idp_dms_bridge_pkg.log_to_dms(
+                pn_tenant_id        => pn_tenant_id
+               ,pv_username         => pv_username
+               ,pv_result           => CASE 
+                                           WHEN pb_was_successful THEN 'SUCCESS'
+                                           WHEN pv_event_type = 'AUTH_FAILURE' THEN 'FAILED'
+                                           ELSE pv_event_type
+                                       END
+               ,pv_ip_address       => pv_client_ip
+               ,pv_auth_method      => pv_auth_method
+               ,pv_failure_reason   => pv_error_message
+               ,pv_user_agent       => pv_user_agent
+               ,pv_provider_type    => lv_provider_type
+            );
+        EXCEPTION
+            WHEN OTHERS THEN
+                NULL; -- Don't fail authentication if bridge fails
+        END;
+    
+            COMMIT;
+        EXCEPTION
+            WHEN OTHERS THEN
+                ROLLBACK;
+        END log_auth_event_old;
     
     -- ========================================================================
     -- get_default_provider
@@ -605,9 +762,10 @@ AS
         ,pv_user_agent          IN  VARCHAR2 DEFAULT NULL
         )
     RETURN VARCHAR2 IS
-        lv_token        VARCHAR2(256);
-        lv_refresh      VARCHAR2(256);
+        lv_token            VARCHAR2(256);
+        lv_refresh          VARCHAR2(256);
         lv_client_ip        VARCHAR2(4000);
+        lv_session_token    VARCHAR2(4000);
     BEGIN
         lv_client_ip := get_client_ip();
         lv_token := generate_token(64);
@@ -622,6 +780,20 @@ AS
             ,SYSTIMESTAMP + NUMTODSINTERVAL(pn_duration_seconds, 'SECOND')
             ,NVL(pv_client_ip, lv_client_ip)
             ,NVL(pv_user_agent, OWA_UTIL.GET_CGI_ENV('HTTP_USER_AGENT')));
+
+        -- Bridge to DMS session management
+        BEGIN
+            IDP.idp_dms_bridge_pkg.bridge_create_session(
+                pn_tenant_id        => pn_tenant_id
+               ,pv_user_id          => pv_user_id
+               ,pv_session_token    => lv_session_token
+               ,pv_ip_address       => pv_client_ip
+               ,pn_timeout_minutes  => ROUND(pn_duration_seconds / 60)
+            );
+        EXCEPTION
+            WHEN OTHERS THEN
+                NULL;
+        END;
         
         log_auth_event(
             pn_tenant_id        => pn_tenant_id
@@ -726,6 +898,19 @@ AS
               ,invalidated_date = SYSTIMESTAMP
          WHERE tenant_id = pn_tenant_id
            AND session_token = pv_session_token;
+
+    -- Bridge to DMS session termination
+    BEGIN
+        IDP.idp_dms_bridge_pkg.bridge_terminate_session(
+            pn_tenant_id        => pn_tenant_id
+           ,pv_session_token    => pv_session_token
+           ,pv_reason           => pv_reason
+        );
+    EXCEPTION
+        WHEN OTHERS THEN
+            NULL;
+    END;
+
         COMMIT;
     END invalidate_session;
     
@@ -956,6 +1141,28 @@ AS
                 lv_provider_type := gc_provider_native;
             END IF;
         END IF;
+       
+        -- Bridge authentication result to DMS SOC2
+        BEGIN
+            IDP.idp_dms_bridge_pkg.log_to_dms(
+                pn_tenant_id        => pn_tenant_id
+               ,pv_username         => lt_result.username
+               ,pv_result           => CASE 
+                                           WHEN lt_result.is_authenticated THEN 'SUCCESS'
+                                           ELSE 'FAILED'
+                                       END
+               ,pv_ip_address       => pv_client_ip
+               ,pv_auth_method      => lt_result.provider_type
+               ,pv_mfa_method       => CASE WHEN lt_result.mfa_required THEN 'REQUIRED' ELSE 'NONE' END
+               ,pv_failure_reason   => lt_result.error_message
+               ,pv_session_id       => lt_result.session_token
+               ,pv_user_agent       => pv_user_agent
+               ,pv_provider_type    => lt_result.provider_type
+            );
+        EXCEPTION
+            WHEN OTHERS THEN
+                NULL;
+        END;       
         
         IF lv_provider_type = gc_provider_native OR ln_aip_id IS NULL THEN
             RETURN authenticate_native(pn_tenant_id, pv_username, pv_password, pv_client_ip);
@@ -1353,5 +1560,416 @@ AS
         RETURN ln_count;
     END get_failed_attempts;
 
+    -- ============================================================================
+    -- SECTION 1: Main APEX Authentication Function
+    -- ============================================================================
+    FUNCTION apex_authenticate
+        (p_username     IN VARCHAR2
+        ,p_password     IN VARCHAR2
+        )
+    RETURN BOOLEAN
+    AS
+        lt_result           T_AUTH_RESULT;
+        lt_mfa_status       MFA_AUTH_PKG.T_MFA_STATUS;
+        ln_tenant_id        NUMBER;
+        lv_client_ip        VARCHAR2(50);
+        lv_user_agent       VARCHAR2(1000);
+        lv_device_token     VARCHAR2(256);
+        lb_device_trusted   BOOLEAN := FALSE;
+    BEGIN
+        -- ========================================================================
+        -- Get tenant ID from APEX application item or default
+        -- ========================================================================
+        BEGIN
+            ln_tenant_id := NVL(TO_NUMBER(V('G_TENANT_ID')), 1);
+        EXCEPTION
+            WHEN OTHERS THEN
+                ln_tenant_id := 1;
+        END;
+        
+        -- ========================================================================
+        -- Get client information
+        -- ========================================================================
+        BEGIN
+            lv_client_ip := OWA_UTIL.GET_CGI_ENV('REMOTE_ADDR');
+            lv_user_agent := SUBSTR(OWA_UTIL.GET_CGI_ENV('HTTP_USER_AGENT'), 1, 1000);
+        EXCEPTION
+            WHEN OTHERS THEN
+                lv_client_ip := 'UNKNOWN';
+                lv_user_agent := 'UNKNOWN';
+        END;
+        
+        -- ========================================================================
+        -- Call federated authentication
+        -- This automatically logs to both IDP and DMS SOC2 via bridge
+        -- ========================================================================
+        lt_result := IDP.federated_auth_pkg.authenticate(
+            pn_tenant_id    => ln_tenant_id
+           ,pv_username     => p_username
+           ,pv_password     => p_password
+           ,pv_client_ip    => lv_client_ip
+           ,pv_user_agent   => lv_user_agent
+        );
+        
+        -- ========================================================================
+        -- Handle authentication failure
+        -- ========================================================================
+        IF NOT lt_result.is_authenticated THEN
+            -- Already logged via bridge - just return false
+            RETURN FALSE;
+        END IF;
+        
+        -- ========================================================================
+        -- Check if MFA is required
+        -- ========================================================================
+        lt_mfa_status := IDP.mfa_auth_pkg.get_mfa_status(
+            pn_tenant_id    => ln_tenant_id
+           ,pv_user_id      => lt_result.user_id
+        );
+        
+        -- ========================================================================
+        -- Check for trusted device (skip MFA if trusted)
+        -- ========================================================================
+        IF lt_mfa_status.is_required OR lt_result.mfa_required THEN
+            -- Check device trust cookie
+            BEGIN
+                lv_device_token := OWA_COOKIE.GET('MFA_DEVICE_TOKEN').vals(1);
+                IF lv_device_token IS NOT NULL THEN
+                    lb_device_trusted := IDP.mfa_auth_pkg.is_device_trusted(
+                        pn_tenant_id    => ln_tenant_id
+                       ,pv_user_id      => lt_result.user_id
+                       ,pv_device_token => lv_device_token
+                    );
+                END IF;
+            EXCEPTION
+                WHEN OTHERS THEN
+                    lb_device_trusted := FALSE;
+            END;
+        END IF;
+        
+        -- ========================================================================
+        -- Store session information in APEX
+        -- ========================================================================
+        -- Store IDP session token
+        APEX_UTIL.SET_SESSION_STATE('G_IDP_SESSION_TOKEN', lt_result.session_token);
+        
+        -- Store user information
+        APEX_UTIL.SET_SESSION_STATE('G_USER_EMAIL', lt_result.email);
+        APEX_UTIL.SET_SESSION_STATE('G_USER_DISPLAY_NAME', lt_result.display_name);
+        APEX_UTIL.SET_SESSION_STATE('G_USER_ROLES', lt_result.roles);
+        APEX_UTIL.SET_SESSION_STATE('G_AUTH_PROVIDER', lt_result.provider_type);
+        
+        -- ========================================================================
+        -- Handle MFA requirement
+        -- ========================================================================
+        IF (lt_mfa_status.is_required OR lt_result.mfa_required) 
+           AND NOT lb_device_trusted 
+           AND lt_mfa_status.is_enrolled THEN
+            -- MFA required and user is enrolled - need verification
+            APEX_UTIL.SET_SESSION_STATE('G_PENDING_USER', lt_result.user_id);
+            APEX_UTIL.SET_SESSION_STATE('G_MFA_REQUIRED', 'Y');
+            APEX_UTIL.SET_SESSION_STATE('G_MFA_VERIFIED', 'N');
+        ELSIF (lt_mfa_status.is_required OR lt_result.mfa_required) 
+              AND NOT lb_device_trusted 
+              AND NOT lt_mfa_status.is_enrolled
+              AND lt_mfa_status.in_grace_period THEN
+            -- MFA required but user not enrolled and in grace period
+            APEX_UTIL.SET_SESSION_STATE('G_MFA_REQUIRED', 'Y');
+            APEX_UTIL.SET_SESSION_STATE('G_MFA_VERIFIED', 'N');
+            APEX_UTIL.SET_SESSION_STATE('G_MFA_ENROLL_REQUIRED', 'Y');
+            APEX_UTIL.SET_SESSION_STATE('G_MFA_GRACE_DAYS', TO_CHAR(lt_mfa_status.grace_days_left));
+        ELSIF (lt_mfa_status.is_required OR lt_result.mfa_required) 
+              AND NOT lb_device_trusted 
+              AND NOT lt_mfa_status.is_enrolled
+              AND NOT lt_mfa_status.in_grace_period THEN
+            -- MFA required, not enrolled, grace period expired - must enroll
+            APEX_UTIL.SET_SESSION_STATE('G_MFA_REQUIRED', 'Y');
+            APEX_UTIL.SET_SESSION_STATE('G_MFA_VERIFIED', 'N');
+            APEX_UTIL.SET_SESSION_STATE('G_MFA_ENROLL_REQUIRED', 'Y');
+            APEX_UTIL.SET_SESSION_STATE('G_MFA_GRACE_DAYS', '0');
+        ELSE
+            -- MFA not required or device is trusted
+            APEX_UTIL.SET_SESSION_STATE('G_MFA_REQUIRED', 'N');
+            APEX_UTIL.SET_SESSION_STATE('G_MFA_VERIFIED', 'Y');
+        END IF;
+        
+        -- Authentication successful
+        RETURN TRUE;
+        
+    EXCEPTION
+        WHEN OTHERS THEN
+            -- Log error internally but don't expose to user
+            RETURN FALSE;
+    END apex_authenticate;
+
+    -- ============================================================================
+    -- SECTION 2: APEX Post-Authentication Procedure
+    -- ============================================================================
+    -- Call this from APEX Application Process (After Authentication)
+    PROCEDURE apex_post_auth
+    AS
+        lv_mfa_required     VARCHAR2(1);
+        lv_mfa_verified     VARCHAR2(1);
+        lv_enroll_required  VARCHAR2(1);
+    BEGIN
+        -- Get MFA status from session
+        lv_mfa_required := V('G_MFA_REQUIRED');
+        lv_mfa_verified := V('G_MFA_VERIFIED');
+        lv_enroll_required := V('G_MFA_ENROLL_REQUIRED');
+        
+        -- Redirect based on MFA status
+        IF lv_mfa_required = 'Y' AND NVL(lv_mfa_verified, 'N') = 'N' THEN
+            IF lv_enroll_required = 'Y' THEN
+                -- Redirect to MFA enrollment page
+                APEX_UTIL.REDIRECT_URL(
+                    p_url => APEX_PAGE.GET_URL(p_page => 105)  -- MFA Enrollment
+                );
+            ELSE
+                -- Redirect to MFA verification page
+                APEX_UTIL.REDIRECT_URL(
+                    p_url => APEX_PAGE.GET_URL(p_page => 102)  -- MFA Verify
+                );
+            END IF;
+        END IF;
+        
+        -- If we get here, no redirect needed
+    END apex_post_auth;
+    
+    -- ============================================================================
+    -- SECTION 3: MFA Verification Procedure (for Page 102)
+    -- ============================================================================
+    PROCEDURE verify_mfa_code
+        (p_totp_code        IN  VARCHAR2
+        ,p_remember_device  IN  VARCHAR2 DEFAULT 'N'
+        ,p_success          OUT VARCHAR2
+        ,p_message          OUT VARCHAR2
+        )
+    AS
+        lb_valid            BOOLEAN;
+        ln_tenant_id        NUMBER;
+        lv_user_id          VARCHAR2(100);
+        lv_client_ip        VARCHAR2(50);
+        lv_user_agent       VARCHAR2(1000);
+        lv_device_token     VARCHAR2(256);
+    BEGIN
+        -- Initialize
+        p_success := 'N';
+        p_message := NULL;
+        
+        -- Get session values
+        ln_tenant_id := NVL(TO_NUMBER(V('G_TENANT_ID')), 1);
+        lv_user_id := V('G_PENDING_USER');
+        
+        IF lv_user_id IS NULL THEN
+            lv_user_id := V('APP_USER');
+        END IF;
+        
+        IF lv_user_id IS NULL THEN
+            p_message := 'Session expired. Please log in again.';
+            RETURN;
+        END IF;
+        
+        -- Get client info
+        lv_client_ip := OWA_UTIL.GET_CGI_ENV('REMOTE_ADDR');
+        lv_user_agent := SUBSTR(OWA_UTIL.GET_CGI_ENV('HTTP_USER_AGENT'), 1, 1000);
+        
+        -- Verify TOTP code
+        -- This automatically logs to DMS SOC2 via bridge!
+        lb_valid := IDP.mfa_auth_pkg.verify_totp(
+            pn_tenant_id    => ln_tenant_id
+           ,pv_user_id      => lv_user_id
+           ,pv_totp_code    => p_totp_code
+           ,pv_client_ip    => lv_client_ip
+           ,pv_session_id   => V('APP_SESSION')
+        );
+        
+        IF NOT lb_valid THEN
+            p_message := 'Invalid code. Please try again.';
+            RETURN;
+        END IF;
+        
+        -- MFA verified!
+        APEX_UTIL.SET_SESSION_STATE('G_MFA_VERIFIED', 'Y');
+        APEX_UTIL.SET_SESSION_STATE('G_PENDING_USER', NULL);
+        
+        -- Handle "Remember this device"
+        IF UPPER(p_remember_device) = 'Y' THEN
+            lb_valid := IDP.mfa_auth_pkg.trust_device(
+                pn_tenant_id    => ln_tenant_id
+               ,pv_user_id      => lv_user_id
+               ,pv_device_name  => 'Web Browser'
+               ,pv_user_agent   => lv_user_agent
+               ,pv_client_ip    => lv_client_ip
+               ,pv_device_token => lv_device_token
+            );
+            
+            -- Set cookie for trusted device
+            IF lv_device_token IS NOT NULL THEN
+                OWA_COOKIE.SEND(
+                    name    => 'MFA_DEVICE_TOKEN'
+                   ,value   => lv_device_token
+                   ,expires => SYSDATE + 30
+                   ,domain  => NULL
+                   ,path    => '/'
+                   ,secure  => 'Y'
+                   ,httponly => 'Y'
+                );
+            END IF;
+        END IF;
+        
+        p_success := 'Y';
+        p_message := 'Verification successful.';
+        
+    EXCEPTION
+        WHEN OTHERS THEN
+            p_success := 'N';
+            p_message := 'An error occurred. Please try again.';
+    END verify_mfa_code;
+    
+    -- ============================================================================
+    -- SECTION 4: Backup Code Verification Procedure
+    -- ============================================================================
+    PROCEDURE verify_backup_code
+        (p_backup_code      IN  VARCHAR2
+        ,p_success          OUT VARCHAR2
+        ,p_message          OUT VARCHAR2
+        ,p_codes_remaining  OUT NUMBER
+        )
+    AS
+        lb_valid            BOOLEAN;
+        ln_tenant_id        NUMBER;
+        lv_user_id          VARCHAR2(100);
+        lv_client_ip        VARCHAR2(50);
+    BEGIN
+        -- Initialize
+        p_success := 'N';
+        p_message := NULL;
+        p_codes_remaining := 0;
+        
+        -- Get session values
+        ln_tenant_id := NVL(TO_NUMBER(V('G_TENANT_ID')), 1);
+        lv_user_id := NVL(V('G_PENDING_USER'), V('APP_USER'));
+        lv_client_ip := OWA_UTIL.GET_CGI_ENV('REMOTE_ADDR');
+        
+        IF lv_user_id IS NULL THEN
+            p_message := 'Session expired. Please log in again.';
+            RETURN;
+        END IF;
+        
+        -- Verify backup code
+        -- This automatically logs to DMS SOC2 via bridge!
+        lb_valid := IDP.mfa_auth_pkg.verify_backup_code(
+            pn_tenant_id    => ln_tenant_id
+           ,pv_user_id      => lv_user_id
+           ,pv_backup_code  => p_backup_code
+           ,pv_client_ip    => lv_client_ip
+        );
+        
+        IF NOT lb_valid THEN
+            p_message := 'Invalid backup code.';
+            RETURN;
+        END IF;
+        
+        -- Get remaining codes count
+        p_codes_remaining := IDP.mfa_auth_pkg.get_backup_code_count(
+            pn_tenant_id    => ln_tenant_id
+           ,pv_user_id      => lv_user_id
+        );
+        
+        -- MFA verified!
+        APEX_UTIL.SET_SESSION_STATE('G_MFA_VERIFIED', 'Y');
+        APEX_UTIL.SET_SESSION_STATE('G_PENDING_USER', NULL);
+        
+        p_success := 'Y';
+        IF p_codes_remaining <= 2 THEN
+            p_message := 'Verification successful. Warning: Only ' || 
+                         p_codes_remaining || ' backup code(s) remaining!';
+        ELSE
+            p_message := 'Verification successful.';
+        END IF;
+        
+    EXCEPTION
+        WHEN OTHERS THEN
+            p_success := 'N';
+            p_message := 'An error occurred. Please try again.';
+    END verify_backup_code;
+
+    -- ============================================================================
+    -- SECTION 5: Logout Procedure
+    -- ============================================================================
+    PROCEDURE apex_logout
+    AS
+        ln_tenant_id        NUMBER;
+        lv_session_token    VARCHAR2(256);
+    BEGIN
+        -- Get session values
+        ln_tenant_id := NVL(TO_NUMBER(V('G_TENANT_ID')), 1);
+        lv_session_token := V('G_IDP_SESSION_TOKEN');
+        
+        -- Invalidate IDP session (logs to SOC2 automatically)
+        IF lv_session_token IS NOT NULL THEN
+            IDP.federated_auth_pkg.invalidate_session(
+                pn_tenant_id    => ln_tenant_id
+               ,pv_session_token => lv_session_token
+               ,pv_reason       => 'USER_LOGOUT'
+            );
+        END IF;
+        
+        -- Clear session state
+        APEX_UTIL.SET_SESSION_STATE('G_IDP_SESSION_TOKEN', NULL);
+        APEX_UTIL.SET_SESSION_STATE('G_MFA_REQUIRED', NULL);
+        APEX_UTIL.SET_SESSION_STATE('G_MFA_VERIFIED', NULL);
+        APEX_UTIL.SET_SESSION_STATE('G_PENDING_USER', NULL);
+        
+    EXCEPTION
+        WHEN OTHERS THEN
+            NULL; -- Don't fail logout
+    END apex_logout;
+
+    -- ============================================================================
+    -- SECTION 6: Session Refresh Procedure
+    -- ============================================================================
+    PROCEDURE refresh_session
+    AS
+        ln_tenant_id        NUMBER;
+        lv_session_token    VARCHAR2(256);
+    BEGIN
+        ln_tenant_id := NVL(TO_NUMBER(V('G_TENANT_ID')), 1);
+        lv_session_token := V('G_IDP_SESSION_TOKEN');
+        
+        IF lv_session_token IS NOT NULL THEN
+            IDP.federated_auth_pkg.refresh_session(
+                pn_tenant_id        => ln_tenant_id
+               ,pv_session_token    => lv_session_token
+               ,pn_extension_seconds => 1800  -- 30 minutes
+            );
+        END IF;
+        
+    EXCEPTION
+        WHEN OTHERS THEN
+            NULL; -- Don't fail on refresh
+    END refresh_session;
+
+    -- ============================================================================
+    -- SECTION 7: Page Security Check Function
+    -- ============================================================================
+    -- Use this in Authorization Schemes to ensure MFA is complete
+    FUNCTION is_mfa_complete
+    RETURN BOOLEAN
+    AS
+        lv_mfa_required VARCHAR2(1);
+        lv_mfa_verified VARCHAR2(1);
+    BEGIN
+        lv_mfa_required := V('G_MFA_REQUIRED');
+        lv_mfa_verified := V('G_MFA_VERIFIED');
+        
+        -- If MFA not required, access granted
+        IF NVL(lv_mfa_required, 'N') = 'N' THEN
+            RETURN TRUE;
+        END IF;
+        
+        -- If MFA required, check if verified
+        RETURN (NVL(lv_mfa_verified, 'N') = 'Y');
+    END is_mfa_complete;
 END federated_auth_pkg;
 /

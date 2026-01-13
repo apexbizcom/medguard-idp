@@ -63,7 +63,7 @@ PROMPT Granted: DMS can read IDP audit logs for SOC2 reporting
 PROMPT Granting DMS access to IDP packages...
 
 -- Allow DMS to call IDP authentication (for custom APEX auth)
-GRANT EXECUTE ON IDP.federated_auth_pkg TO DMS;
+GRANT EXECUTE ON IDP.federated_auth_pkg TO DMS, APEX_PUBLIC_USER;
 GRANT EXECUTE ON IDP.mfa_auth_pkg TO DMS;
 GRANT EXECUTE ON IDP.idp_dms_bridge_pkg TO DMS;
 
